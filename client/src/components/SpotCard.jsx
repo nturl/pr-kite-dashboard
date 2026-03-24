@@ -1,8 +1,11 @@
+import { useState } from 'react';
 import WindGauge, { getWindColor, getWindLabel } from './WindGauge';
 import WindArrow from './WindArrow';
 import HourlyForecast from './HourlyForecast';
+import DailyForecast from './DailyForecast';
 
 export default function SpotCard({ spot, selected, onClick }) {
+  const [forecastTab, setForecastTab] = useState('24h');
   const wind  = spot.wind;
   const avg   = wind?.avg;
   const label = getWindLabel(avg);
@@ -91,19 +94,41 @@ export default function SpotCard({ spot, selected, onClick }) {
         </div>
       </div>
 
-      {/* Hourly forecast — only when selected */}
+      {/* Forecast — only when selected */}
       {selected && (
         <div style={{
           marginTop: 16, paddingTop: 14,
           borderTop: '1px solid rgba(255,255,255,0.07)',
         }}>
-          <div style={{
-            fontSize: 10, fontWeight: 600, letterSpacing: '0.1em',
-            color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 10,
-          }}>
-            24-Hour Forecast
+          {/* Tab toggle */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <div style={{
+              fontSize: 10, fontWeight: 600, letterSpacing: '0.1em',
+              color: 'var(--text-muted)', textTransform: 'uppercase',
+            }}>
+              {forecastTab === '24h' ? '24-Hour Forecast' : '7-Day Forecast'}
+            </div>
+            <div style={{ display: 'flex', gap: 2 }}>
+              {['24h', '7d'].map(tab => (
+                <button
+                  key={tab}
+                  onClick={e => { e.stopPropagation(); setForecastTab(tab); }}
+                  style={{
+                    background: forecastTab === tab ? 'rgba(0,229,255,0.12)' : 'transparent',
+                    border: `1px solid ${forecastTab === tab ? 'rgba(0,229,255,0.35)' : 'rgba(255,255,255,0.1)'}`,
+                    borderRadius: 6, padding: '2px 8px',
+                    color: forecastTab === tab ? 'var(--cyan)' : 'var(--text-muted)',
+                    fontSize: 9, fontWeight: 600, cursor: 'pointer',
+                    fontFamily: 'var(--font-main)', letterSpacing: '0.06em',
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  {tab.toUpperCase()}
+                </button>
+              ))}
+            </div>
           </div>
-          <HourlyForecast spot={spot} />
+          {forecastTab === '24h' ? <HourlyForecast spot={spot} /> : <DailyForecast spot={spot} />}
         </div>
       )}
 

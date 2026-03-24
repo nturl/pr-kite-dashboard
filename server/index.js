@@ -9,7 +9,7 @@ app.use(express.json());
 const KPH_TO_KTS  = 0.539957;
 const MS_TO_KTS   = 1.94384;
 const NOAA_UA     = 'KitePR-Dashboard/1.0 (kitesurfing wind tracker)';
-const CACHE_TTL   = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL   = 15 * 60 * 1000; // 15 minutes
 
 // Simple in-memory cache
 const cache = { data: null, ts: 0 };
@@ -226,7 +226,7 @@ async function refreshCache() {
   const results = [];
   for (const spot of PR_SPOTS) {
     results.push(await fetchSpot(spot));
-    await sleep(300); // 300ms between every request
+    await sleep(800); // 800ms between requests to avoid Open-Meteo rate limiting
   }
   cache.data = results;
   cache.ts   = Date.now();
@@ -242,9 +242,9 @@ app.get('/api/spots', async (req, res) => {
   res.json(results);
 });
 
-// Pre-warm cache on startup and refresh every 10 minutes
+// Pre-warm cache on startup and refresh every 20 minutes
 refreshCache();
-setInterval(refreshCache, 10 * 60 * 1000);
+setInterval(refreshCache, 20 * 60 * 1000);
 
 app.get('/api/spot/:id', async (req, res) => {
   const spotId = parseInt(req.params.id);
@@ -278,6 +278,33 @@ app.get('/api/forecast', async (req, res) => {
       .filter(h => new Date(h.time) >= new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()))
       .slice(0, 24);
     res.json(hours);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/forecast/daily', async (req, res) => {
+  const { lat, lon } = req.query;
+  if (!lat || !lon) return res.status(400).json({ error: 'lat and lon required' });
+  try {
+    const result = await axios.get('https://api.open-meteo.com/v1/forecast', {
+      params: {
+        latitude: lat, longitude: lon,
+        daily: 'wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant',
+        wind_speed_unit: 'kn',
+        timezone: 'America/Puerto_Rico',
+        forecast_days: 7,
+      },
+      timeout: 10000,
+    });
+    const d = result.data.daily;
+    const days = d.time.map((date, i) => ({
+      date,
+      max:       d.wind_speed_10m_max[i]         != null ? parseFloat(d.wind_speed_10m_max[i].toFixed(1))         : null,
+      gust:      d.wind_gusts_10m_max[i]         != null ? parseFloat(d.wind_gusts_10m_max[i].toFixed(1))         : null,
+      direction: d.wind_direction_10m_dominant[i] ?? null,
+    }));
+    res.json(days);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

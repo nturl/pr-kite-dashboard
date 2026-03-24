@@ -219,21 +219,129 @@ async function fetchSpot(spot) {
   }
 }
 
-// ── Routes ───────────────────────────────────────────────────────────────
-// Fetch all spots sequentially to avoid rate limiting Open-Meteo
+// ── Open-Meteo batch (fetch multiple spots in ONE request) ───────────────
+async function fetchOpenMeteoBatch(spots) {
+  if (!spots.length) return [];
+  const res = await axios.get('https://api.open-meteo.com/v1/forecast', {
+    params: {
+      latitude:  spots.map(s => s.lat).join(','),
+      longitude: spots.map(s => s.lon).join(','),
+      current:   'wind_speed_10m,wind_direction_10m,wind_gusts_10m',
+      wind_speed_unit: 'kn',
+      timezone:  'America/Puerto_Rico',
+    },
+    timeout: 15000,
+  });
+  const items = Array.isArray(res.data) ? res.data : [res.data];
+  return items.map(r => {
+    const c = r?.current;
+    if (!c) return null;
+    return {
+      avg:           c.wind_speed_10m    != null ? parseFloat(c.wind_speed_10m.toFixed(1))    : null,
+      gust:          c.wind_gusts_10m   != null ? parseFloat(c.wind_gusts_10m.toFixed(1))   : null,
+      direction:     c.wind_direction_10m ?? null,
+      directionText: degToCompass(c.wind_direction_10m),
+      timestamp:     c.time,
+      source:        'open-meteo',
+      isGustOnly:    false,
+    };
+  });
+}
+
+// ── Refresh guard — prevents concurrent duplicate refreshes ──────────────
+let refreshPromise = null;
+
 async function refreshCache() {
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = _doRefresh().finally(() => { refreshPromise = null; });
+  return refreshPromise;
+}
+
+async function _doRefresh() {
   console.log('Refreshing wind cache...');
-  const results = [];
-  for (const spot of PR_SPOTS) {
-    results.push(await fetchSpot(spot));
-    await sleep(800); // 800ms between requests to avoid Open-Meteo rate limiting
+
+  // Spots with dedicated live stations (iKitesurf / NOAA / NDBC)
+  const stationSpots   = PR_SPOTS.filter(s => s.id || s.noaa || s.buoy);
+  // Pure Open-Meteo spots (no dedicated station)
+  const openMeteoSpots = PR_SPOTS.filter(s => !s.id && !s.noaa && !s.buoy);
+
+  // Fetch all station spots in parallel — different APIs, no shared rate limit
+  const stationResults = await Promise.all(stationSpots.map(s => fetchSpot(s)));
+
+  // Batch-fetch all pure Open-Meteo spots in ONE request instead of individually
+  let omResults = openMeteoSpots.map(s => ({ ...s, wind: null }));
+  if (openMeteoSpots.length > 0) {
+    try {
+      const winds = await fetchOpenMeteoBatch(openMeteoSpots);
+      omResults = openMeteoSpots.map((s, i) => ({ ...s, wind: winds[i] || null }));
+    } catch (err) {
+      console.error('Open-Meteo batch error:', err.message);
+    }
   }
+
+  // Reassemble in original PR_SPOTS order
+  const byName = new Map([
+    ...stationResults.map(r => [r.name, r]),
+    ...omResults.map(r => [r.name, r]),
+  ]);
+  const results = PR_SPOTS.map(s => byName.get(s.name) || { ...s, wind: null });
+
   cache.data = results;
   cache.ts   = Date.now();
   console.log('Cache refreshed:', results.filter(s => s.wind?.avg != null).length + '/' + results.length + ' spots with data');
   return results;
 }
 
+// ── Per-location forecast cache (30 min TTL) ─────────────────────────────
+const forecastCache = new Map();
+const FORECAST_TTL  = 30 * 60 * 1000;
+
+async function getForecast(lat, lon) {
+  const key = `${parseFloat(lat).toFixed(4)},${parseFloat(lon).toFixed(4)}`;
+  const cached = forecastCache.get(key);
+  if (cached && Date.now() - cached.ts < FORECAST_TTL) return cached;
+
+  // Fetch hourly + daily in a single Open-Meteo request
+  const result = await axios.get('https://api.open-meteo.com/v1/forecast', {
+    params: {
+      latitude:  lat,
+      longitude: lon,
+      hourly: 'wind_speed_10m,wind_direction_10m,wind_gusts_10m',
+      daily:  'wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant',
+      wind_speed_unit: 'kn',
+      timezone:  'America/Puerto_Rico',
+      forecast_days: 7,
+    },
+    timeout: 15000,
+  });
+
+  const h   = result.data.hourly;
+  const d   = result.data.daily;
+  const now = new Date();
+
+  const hourly = h.time
+    .map((t, i) => ({
+      time:      t,
+      avg:       h.wind_speed_10m[i]    != null ? parseFloat(h.wind_speed_10m[i].toFixed(1))    : null,
+      gust:      h.wind_gusts_10m[i]   != null ? parseFloat(h.wind_gusts_10m[i].toFixed(1))   : null,
+      direction: h.wind_direction_10m[i] ?? null,
+    }))
+    .filter(hr => new Date(hr.time) >= new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()))
+    .slice(0, 24);
+
+  const daily = d.time.map((date, i) => ({
+    date,
+    max:       d.wind_speed_10m_max[i]          != null ? parseFloat(d.wind_speed_10m_max[i].toFixed(1))          : null,
+    gust:      d.wind_gusts_10m_max[i]          != null ? parseFloat(d.wind_gusts_10m_max[i].toFixed(1))          : null,
+    direction: d.wind_direction_10m_dominant[i] ?? null,
+  }));
+
+  const data = { hourly, daily, ts: Date.now() };
+  forecastCache.set(key, data);
+  return data;
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────
 app.get('/api/spots', async (req, res) => {
   if (cache.data && Date.now() - cache.ts < CACHE_TTL) {
     return res.json(cache.data);
@@ -242,7 +350,7 @@ app.get('/api/spots', async (req, res) => {
   res.json(results);
 });
 
-// Pre-warm cache on startup and refresh every 20 minutes
+// Pre-warm cache on startup; refresh every 20 min
 refreshCache();
 setInterval(refreshCache, 20 * 60 * 1000);
 
@@ -256,28 +364,8 @@ app.get('/api/forecast', async (req, res) => {
   const { lat, lon } = req.query;
   if (!lat || !lon) return res.status(400).json({ error: 'lat and lon required' });
   try {
-    const result = await axios.get('https://api.open-meteo.com/v1/forecast', {
-      params: {
-        latitude: lat, longitude: lon,
-        hourly: 'wind_speed_10m,wind_direction_10m,wind_gusts_10m',
-        wind_speed_unit: 'kn',
-        timezone: 'America/Puerto_Rico',
-        forecast_days: 2,
-      },
-      timeout: 10000,
-    });
-    const h = result.data.hourly;
-    const now = new Date();
-    const hours = h.time
-      .map((t, i) => ({
-        time:      t,
-        avg:       h.wind_speed_10m[i]    != null ? parseFloat(h.wind_speed_10m[i].toFixed(1))    : null,
-        gust:      h.wind_gusts_10m[i]   != null ? parseFloat(h.wind_gusts_10m[i].toFixed(1))   : null,
-        direction: h.wind_direction_10m[i] ?? null,
-      }))
-      .filter(h => new Date(h.time) >= new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()))
-      .slice(0, 24);
-    res.json(hours);
+    const data = await getForecast(lat, lon);
+    res.json(data.hourly);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -287,24 +375,8 @@ app.get('/api/forecast/daily', async (req, res) => {
   const { lat, lon } = req.query;
   if (!lat || !lon) return res.status(400).json({ error: 'lat and lon required' });
   try {
-    const result = await axios.get('https://api.open-meteo.com/v1/forecast', {
-      params: {
-        latitude: lat, longitude: lon,
-        daily: 'wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant',
-        wind_speed_unit: 'kn',
-        timezone: 'America/Puerto_Rico',
-        forecast_days: 7,
-      },
-      timeout: 10000,
-    });
-    const d = result.data.daily;
-    const days = d.time.map((date, i) => ({
-      date,
-      max:       d.wind_speed_10m_max[i]         != null ? parseFloat(d.wind_speed_10m_max[i].toFixed(1))         : null,
-      gust:      d.wind_gusts_10m_max[i]         != null ? parseFloat(d.wind_gusts_10m_max[i].toFixed(1))         : null,
-      direction: d.wind_direction_10m_dominant[i] ?? null,
-    }));
-    res.json(days);
+    const data = await getForecast(lat, lon);
+    res.json(data.daily);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

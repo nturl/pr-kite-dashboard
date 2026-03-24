@@ -220,44 +220,31 @@ async function fetchSpot(spot) {
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────
+// Fetch all spots sequentially to avoid rate limiting Open-Meteo
+async function refreshCache() {
+  console.log('Refreshing wind cache...');
+  const results = [];
+  for (const spot of PR_SPOTS) {
+    results.push(await fetchSpot(spot));
+    await sleep(300); // 300ms between every request
+  }
+  cache.data = results;
+  cache.ts   = Date.now();
+  console.log('Cache refreshed:', results.filter(s => s.wind?.avg != null).length + '/' + results.length + ' spots with data');
+  return results;
+}
+
 app.get('/api/spots', async (req, res) => {
-  // Serve from cache if fresh
   if (cache.data && Date.now() - cache.ts < CACHE_TTL) {
     return res.json(cache.data);
   }
-
-  // Separate spots by source type to stagger Open-Meteo calls
-  const ikitesurfSpots = PR_SPOTS.filter(s => s.id);
-  const noaaSpots      = PR_SPOTS.filter(s => s.noaa);
-  const buoySpots      = PR_SPOTS.filter(s => s.buoy);
-  const meteoSpots     = PR_SPOTS.filter(s => !s.id && !s.noaa && !s.buoy);
-
-  // Fetch iKitesurf, NOAA, and buoys concurrently (they hit different APIs)
-  const [ikitesurfResults, noaaResults, buoyResults] = await Promise.all([
-    Promise.all(ikitesurfSpots.map(fetchSpot)),
-    Promise.all(noaaSpots.map(fetchSpot)),
-    Promise.all(buoySpots.map(fetchSpot)),
-  ]);
-
-  // Stagger Open-Meteo calls 200ms apart to avoid rate limiting
-  const meteoResults = [];
-  for (let i = 0; i < meteoSpots.length; i++) {
-    if (i > 0) await sleep(200);
-    meteoResults.push(await fetchSpot(meteoSpots[i]));
-  }
-
-  // Rebuild in original order
-  const resultMap = new Map();
-  [...ikitesurfResults, ...noaaResults, ...buoyResults, ...meteoResults]
-    .forEach(s => resultMap.set(s.id ?? s.noaa ?? s.buoy ?? s.name, s));
-
-  const results = PR_SPOTS.map(s => resultMap.get(s.id ?? s.noaa ?? s.buoy ?? s.name) || s);
-
-  cache.data = results;
-  cache.ts   = Date.now();
-
+  const results = await refreshCache();
   res.json(results);
 });
+
+// Pre-warm cache on startup and refresh every 10 minutes
+refreshCache();
+setInterval(refreshCache, 10 * 60 * 1000);
 
 app.get('/api/spot/:id', async (req, res) => {
   const spotId = parseInt(req.params.id);

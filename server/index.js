@@ -6,9 +6,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const KPH_TO_KTS = 0.539957;
-const MS_TO_KTS  = 1.94384;
-const NOAA_UA    = 'KitePR-Dashboard/1.0 (kitesurfing wind tracker)';
+const KPH_TO_KTS  = 0.539957;
+const MS_TO_KTS   = 1.94384;
+const NOAA_UA     = 'KitePR-Dashboard/1.0 (kitesurfing wind tracker)';
+const CACHE_TTL   = 5 * 60 * 1000; // 5 minutes
+
+// Simple in-memory cache
+const cache = { data: null, ts: 0 };
+
+// Stagger concurrent Open-Meteo calls to avoid rate limiting
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const PR_SPOTS = [
   // ── Kite spots ──────────────────────────────────────────────────────────
@@ -214,7 +221,41 @@ async function fetchSpot(spot) {
 
 // ── Routes ───────────────────────────────────────────────────────────────
 app.get('/api/spots', async (req, res) => {
-  const results = await Promise.all(PR_SPOTS.map(fetchSpot));
+  // Serve from cache if fresh
+  if (cache.data && Date.now() - cache.ts < CACHE_TTL) {
+    return res.json(cache.data);
+  }
+
+  // Separate spots by source type to stagger Open-Meteo calls
+  const ikitesurfSpots = PR_SPOTS.filter(s => s.id);
+  const noaaSpots      = PR_SPOTS.filter(s => s.noaa);
+  const buoySpots      = PR_SPOTS.filter(s => s.buoy);
+  const meteoSpots     = PR_SPOTS.filter(s => !s.id && !s.noaa && !s.buoy);
+
+  // Fetch iKitesurf, NOAA, and buoys concurrently (they hit different APIs)
+  const [ikitesurfResults, noaaResults, buoyResults] = await Promise.all([
+    Promise.all(ikitesurfSpots.map(fetchSpot)),
+    Promise.all(noaaSpots.map(fetchSpot)),
+    Promise.all(buoySpots.map(fetchSpot)),
+  ]);
+
+  // Stagger Open-Meteo calls 200ms apart to avoid rate limiting
+  const meteoResults = [];
+  for (let i = 0; i < meteoSpots.length; i++) {
+    if (i > 0) await sleep(200);
+    meteoResults.push(await fetchSpot(meteoSpots[i]));
+  }
+
+  // Rebuild in original order
+  const resultMap = new Map();
+  [...ikitesurfResults, ...noaaResults, ...buoyResults, ...meteoResults]
+    .forEach(s => resultMap.set(s.id ?? s.noaa ?? s.buoy ?? s.name, s));
+
+  const results = PR_SPOTS.map(s => resultMap.get(s.id ?? s.noaa ?? s.buoy ?? s.name) || s);
+
+  cache.data = results;
+  cache.ts   = Date.now();
+
   res.json(results);
 });
 

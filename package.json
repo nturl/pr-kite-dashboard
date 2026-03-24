@@ -2,7 +2,7 @@
   "name": "pr-kite-dashboard",
   "version": "1.0.0",
   "scripts": {
-    "build": "cd client && npm install && npm run build",
+    "build": "npm install && cd client && npm install && npm run build",
     "start": "node server/index.js"
   },
   "dependencies": {

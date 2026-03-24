@@ -39,7 +39,10 @@ export default function HourlyForecast({ spot }) {
     setHours([]);
     fetch(`/api/forecast?lat=${spot.lat}&lon=${spot.lon}`)
       .then(r => r.json())
-      .then(data => { setHours(data); setLoading(false); })
+      .then(data => {
+        setHours(Array.isArray(data) ? data : []);
+        setLoading(false);
+      })
       .catch(e => { setError(e.message); setLoading(false); });
   }, [spot?.lat, spot?.lon]);
 
